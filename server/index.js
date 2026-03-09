@@ -10,26 +10,133 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 
 dotenv.config();
 
-// Gemini for smart intent detection
+// ─────────────────────────────────────────────────────────────
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const geminiModel = genAI.getGenerativeModel({ model: 'gemini-2.0-flash-lite' });
+const geminiModel = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
 
-async function geminiIntentDetect(text) {
-  const prompt = `You are a banking assistant AI. Analyze the following text and detect the banking service intent.
+// ── NEW: Universal Translation with Fallback ──
+async function universalTranslate(text, fromCode, toCode) {
+  try {
+    // Attempt 1: Google Translate (Preferred)
+    const result = await translate(text, { from: fromCode, to: toCode });
+    return result.text;
+  } catch (error) {
+    console.error(`Google Translate Failed: ${error.message}. Trying MyMemory fallback...`);
 
-Text: "${text}"
+    // Attempt 2: MyMemory API Fallback
+    try {
+      // MyMemory requires explicit langpair like 'hi|en'
+      const langPair = `${fromCode}|${toCode}`;
+      const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${encodeURIComponent(langPair)}`;
+      const response = await fetch(url);
+      const data = await response.json();
 
-Available intents:
-Account Opening, Savings Account, Current Account, Home Loan, Personal Loan, Education Loan, Gold Loan, Loan Enquiry, Fixed Deposit, Recurring Deposit, KYC, KYC Update, Debit Card Issue, Credit Card, Card Block, Balance Enquiry, Statement Request, Net Banking, UPI, Mobile Banking, Fund Transfer, NEFT, RTGS, Cheque Issue, Stop Cheque, Nomination Update, Account Closure, General
+      if (data && data.responseData && data.responseData.translatedText) {
+        console.log(`MyMemory Fallback Success (${langPair}): "${text}" -> "${data.responseData.translatedText}"`);
+        return data.responseData.translatedText;
+      }
+    } catch (fallbackError) {
+      console.error(`MyMemory Fallback also failed: ${fallbackError.message}`);
+    }
 
-Return ONLY valid JSON (no markdown, no explanation):
-{"intent": "<exact intent from list>", "confidence": <0-100>, "keyEntities": ["<key term1>", "<key term2>"]}`;
+    // Final Fallback: Return original text if everything fails
+    return text;
+  }
+}
+
+
+// ─────────────────────────────────────────────────────────────
+// Gemini — Full Banking Intelligence Analysis
+// ─────────────────────────────────────────────────────────────
+// ── INTERNAL AI ANALYZERS ──
+
+async function geminiAnalyze(text, senderRole, conversationHistory = []) {
+  const historyStr = conversationHistory.length
+    ? conversationHistory.map(m => `[${m.senderRole}]: ${m.originalText}`).join('\n')
+    : 'No prior context';
+
+  const prompt = `You are BankBridge, an Indian banking AI assistant.
+Analyze this message and return ONLY JSON.
+Role: ${senderRole}
+Context: ${historyStr}
+Message: "${text}"
+
+JSON SCHEMA:
+{
+  "intent": "Account Opening/Savings Account/Loan Enquiry/KYC/etc",
+  "subIntent": "Specific details or null",
+  "confidence": 0-100,
+  "isAmbiguous": boolean,
+  "clarifyingQuestion": "Simple question if more info needed, else null",
+  "keyEntities": ["list of entities"],
+  "termExplanations": [
+    {"term": "Complex Banking Jargon (EMI, CIBIL, moratorium, NEFT, etc.)", "simple": "1-sentence plain language explanation for a common person"}
+  ],
+  "fraudRisk": {"detected": boolean, "level": "none|low|medium|high", "reason": "string|null"},
+  "customerProtection": {"alert": boolean, "message": "string|null"},
+  "guidance": "1 sentence for banker",
+  "urgency": "normal|high"
+}
+
+JARGON RULES: Any complex terms (moratorium, CIBIL, lien, hypothecation, KYC, collateral, etc.) MUST be explained in "termExplanations".`;
 
   const result = await geminiModel.generateContent(prompt);
   const raw = result.response.text().replace(/^```json\n?/, '').replace(/\n?```$/, '').trim();
   const jm = raw.match(/\{[\s\S]*\}/);
   if (!jm) throw new Error('No JSON in Gemini response');
-  return JSON.parse(jm[0]);
+  return JSON.parse(jm[jm.length - 1]);
+}
+
+async function ollamaAnalyze(text, senderRole, conversationHistory = []) {
+  const historyStr = conversationHistory.length
+    ? conversationHistory.map(m => `[${m.senderRole}]: ${m.originalText}`).join('\n')
+    : 'No prior context';
+
+  const systemPrompt = `You are a banking AI. Analyze the input and return ONLY structured JSON. 
+JSON SCHEMA: {"intent":"string","subIntent":"string","confidence":number,"isAmbiguous":boolean,"clarifyingQuestion":"string|null","keyEntities":["string"],"termExplanations":[{"term":"string","simple":"string"}],"fraudRisk":{"detected":boolean,"level":"none|low|medium|high","reason":"string|null"},"customerProtection":{"alert":boolean,"message":"string|null"},"guidance":"string","urgency":"normal|high"}`;
+
+  const userPrompt = `Role: ${senderRole}\nContext: ${historyStr}\nMessage: "${text}"`;
+
+  try {
+    let rawResponse = await ollamaChat(systemPrompt, userPrompt);
+    rawResponse = rawResponse.replace(/^```json\n?/, '').replace(/\n?```$/, '').trim();
+    const jsonMatch = rawResponse.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      return JSON.parse(jsonMatch[0]);
+    }
+  } catch (e) {
+    console.warn("Ollama Analysis Fallback Failed:", e.message);
+  }
+
+  // Minimal fallback object
+  return {
+    intent: 'General',
+    subIntent: null,
+    confidence: 50,
+    isAmbiguous: false,
+    clarifyingQuestion: null,
+    keyEntities: [],
+    termExplanations: [],
+    fraudRisk: { detected: false, level: 'none', reason: null },
+    customerProtection: { alert: false, message: null },
+    guidance: 'Proceed with the general request.',
+    urgency: 'normal'
+  };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Universal AI Analysis with Resilient Fallback
+// ─────────────────────────────────────────────────────────────
+async function universalAnalyze(text, senderRole, conversationHistory = []) {
+  try {
+    // Attempt 1: Gemini (Advanced)
+    console.log("[AI] Trying Gemini for analysis...");
+    return await geminiAnalyze(text, senderRole, conversationHistory);
+  } catch (error) {
+    console.warn(`[AI] Gemini Failed: ${error.message}. Switching to Ollama local analysis...`);
+    // Attempt 2: Ollama (Local/Resilient)
+    return await ollamaAnalyze(text, senderRole, conversationHistory);
+  }
 }
 
 const app = express();
@@ -365,24 +472,38 @@ io.on('connection', (socket) => {
     console.log(`User ${socket.id} joined room ${roomId}`);
   });
 
+  // User explicitly telling others what they speak
+  socket.on('sync-language', (roomId, speakingLang) => {
+    socket.to(roomId).emit('partner-language-changed', {
+      newLang: speakingLang,
+      senderId: socket.id
+    });
+  });
+
+  // User asking others to tell them what they speak
+  socket.on('request-sync', (roomId) => {
+    socket.to(roomId).emit('please-sync');
+  });
+
   // ── Main Translation + Intent Detection ──
-  socket.on('send-message', async ({ roomId, text, targetLang, context, senderRole }) => {
+  socket.on('send-message', async ({ roomId, text, fromLang, targetLang, context, senderRole, conversationHistory }) => {
     try {
       const LANG_NAME_TO_GT = {
         'Hindi': 'hi', 'Marathi': 'mr', 'Gujarati': 'gu',
         'Tamil': 'ta', 'Telugu': 'te', 'Kannada': 'kn',
         'Bengali': 'bn', 'English': 'en',
       };
+
+      // Use explicit codes for both source and target to fix MyMemory error
+      const fromCode = LANG_NAME_TO_GT[fromLang] || 'auto';
       const gtLang = LANG_NAME_TO_GT[targetLang] || 'en';
 
-      // Step 1: Google Translate (fast ~300-500ms)
-      const expandedText = expandAbbreviations(text);
-      const gtResult = await translate(expandedText, { to: gtLang });
-      const translatedText = applyBankingGlossary(gtResult.text, expandedText, gtLang);
+      // Use Universal Translate with multi-layer fallback
+      const translatedText = await universalTranslate(text, fromCode, gtLang);
 
       console.log(`[${senderRole}] "${text}" → (${gtLang}) "${translatedText}"`);
 
-      // Broadcast translation IMMEDIATELY with General intent (Gemini will update it soon)
+      // Broadcast translation IMMEDIATELY
       io.to(roomId).emit('receive-translation', {
         senderId: socket.id,
         senderRole: senderRole || 'unknown',
@@ -390,7 +511,7 @@ io.on('connection', (socket) => {
         translatedText,
         targetLang,
         intent: 'General',
-        confidence: 70,
+        confidence: 0,
         keyEntities: [],
         knowledgeBase: null,
       });
@@ -400,22 +521,31 @@ io.on('connection', (socket) => {
         if (ttsAudio) socket.to(roomId).emit('tts-audio', { senderId: socket.id, ttsAudio });
       }).catch(e => console.warn('TTS error:', e.message));
 
-      // Gemini intent detection: smart, AI-based, runs in background
-      geminiIntentDetect(text)
-        .then(({ intent, confidence, keyEntities }) => {
-          const kb = getKnowledgeBase(intent);
+      // Universal AI analysis: progressive intent + fraud + customer protection
+      const history = Array.isArray(conversationHistory) ? conversationHistory.slice(-6) : [];
+      universalAnalyze(text, senderRole, history)
+        .then((analysis) => {
+          const kb = getKnowledgeBase(analysis.intent);
+          console.log(`[AI-Insight] intent=${analysis.intent} fraud=${analysis.fraudRisk?.level} confidence=${analysis.confidence}%`);
+
           io.to(roomId).emit('intent-update', {
             senderId: socket.id,
-            intent,
-            confidence,
-            keyEntities,
+            intent: analysis.intent,
+            subIntent: analysis.subIntent,
+            confidence: analysis.confidence,
+            isAmbiguous: analysis.isAmbiguous,
+            clarifyingQuestion: analysis.clarifyingQuestion,
+            keyEntities: analysis.keyEntities,
+            termExplanations: analysis.termExplanations || [],
             knowledgeBase: kb,
+            fraudRisk: analysis.fraudRisk,
+            customerProtection: analysis.customerProtection,
+            guidance: analysis.guidance,
+            urgency: analysis.urgency,
           });
-          console.log(`[Gemini intent] ${intent} (${confidence}%)`);
         })
         .catch(e => {
-          console.warn('Gemini intent failed, skipping:', e.message);
-          // No fallback needed — message already shows with General intent
+          console.warn('AI analysis failed completely:', e.message);
         });
 
     } catch (error) {

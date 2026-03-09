@@ -11,6 +11,7 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "@google/genai": "^1.44.0",
     "@google/generative-ai": "^0.24.1",
     "@vitalets/google-translate-api": "^9.2.1",
     "cors": "^2.8.6",
@@ -20,6 +21,7 @@
     "helmet": "^8.1.0",
     "ollama": "^0.6.3",
     "socket.io": "^4.8.3",
+    "ws": "^8.19.0",
     "zod": "^4.3.6"
   }
 }
