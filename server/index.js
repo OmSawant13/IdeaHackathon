@@ -359,9 +359,108 @@ function applyBankingGlossary(translatedText, originalText, langCode) {
   return result;
 }
 
+const { spawn } = require('child_process');
+const path = require('path');
+
+let ttsWorker = null;
+let ttsQueue = [];
+let isWorkerReady = false;
+
+function spawnTTSWorker() {
+  const venvPython = path.join(__dirname, '..', 'venv', 'bin', 'python');
+  const scriptPath = path.join(__dirname, 'tts_worker.py');
+  
+  console.log('[Parler-TTS] Starting persistent worker...');
+  ttsWorker = spawn(venvPython, [scriptPath]);
+
+  ttsWorker.stdout.on('data', (data) => {
+    const output = data.toString();
+    try {
+      const response = JSON.parse(output);
+      if (ttsQueue.length > 0) {
+        const { resolve, reject } = ttsQueue.shift();
+        if (response.status === 'success') {
+          resolve(`data:audio/wav;base64,${response.audio}`);
+        } else {
+          reject(new Error(response.message));
+        }
+      }
+    } catch (e) {
+      // Not JSON, might be status messages
+      if (output.includes('READY')) {
+        console.log('[Parler-TTS] Worker is READY.');
+        isWorkerReady = true;
+      }
+    }
+  });
+
+  ttsWorker.stderr.on('data', (data) => {
+    const msg = data.toString();
+    if (msg.includes('DEBUG:')) {
+      console.log(`[Parler-TTS-Worker] ${msg.trim()}`);
+    } else if (msg.includes('READY')) {
+      console.log('[Parler-TTS] Worker is READY.');
+      isWorkerReady = true;
+    } else {
+      console.warn(`[Parler-TTS-Worker] ${msg.trim()}`);
+    }
+  });
+
+  ttsWorker.on('exit', (code) => {
+    console.warn(`[Parler-TTS] Worker exited with code ${code}. Restarting...`);
+    isWorkerReady = false;
+    ttsWorker = null;
+    // Notify pending requests
+    while (ttsQueue.length > 0) {
+      const { reject } = ttsQueue.shift();
+      reject(new Error("Worker exited prematurely"));
+    }
+    setTimeout(spawnTTSWorker, 5000); // Wait 5s before restart
+  });
+}
+
+// Initialize worker
+spawnTTSWorker();
+
+async function getParlerTTS(text) {
+  if (!isWorkerReady) {
+    throw new Error("Parler-TTS worker is not ready yet");
+  }
+
+  return new Promise((resolve, reject) => {
+    // Set a generation timeout (5s) to avoid hanging
+    const timeout = setTimeout(() => {
+      const index = ttsQueue.findIndex(q => q.resolve === resolve);
+      if (index !== -1) {
+        ttsQueue.splice(index, 1);
+        reject(new Error("Parler-TTS generation timeout"));
+      }
+    }, 5000);
+
+    const oldResolve = resolve;
+    resolve = (data) => {
+      clearTimeout(timeout);
+      oldResolve(data);
+    };
+
+    ttsQueue.push({ resolve, reject });
+    ttsWorker.stdin.write(JSON.stringify({ text }) + '\n');
+  });
+}
+
 // Fetch Google TTS audio SERVER-SIDE → avoid browser CORS issues
 async function getTTSBase64(text, langName) {
   try {
+    // Try Parler-TTS first if provider is set to 'parler'
+    if (process.env.TTS_PROVIDER === 'parler' || (!process.env.TTS_PROVIDER && langName === 'English')) {
+      try {
+        console.log(`[AI] Using Parler-TTS for: ${text.substring(0, 30)}...`);
+        return await getParlerTTS(text);
+      } catch (e) {
+        console.warn(`[AI] Parler-TTS failed: ${e.message}. Falling back to Google TTS.`);
+      }
+    }
+
     const langCode = LANG_TO_TTS_CODE[langName] || 'en';
     const chunks = googleTTS.getAllAudioUrls(text, {
       lang: langCode,
