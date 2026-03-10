@@ -743,8 +743,8 @@ const App = () => {
   };
 
   const joinMeeting = () => {
-    if (roomId) {
-      socket.emit('join-room', roomId);
+    if (roomId && roomId.trim()) {
+      socket.emit('join-room', roomId.trim());
       setJoined(true);
     }
   };
@@ -776,7 +776,7 @@ const App = () => {
     // LOCAL UI OPTIMISTIC UPDATE: Add the message to our own list immediately
     // to show the user it was sent, but mark it so we don't translate it again if it bounces back.
     const localMsg: Message = {
-      senderId: socket.id,
+      senderId: socket.id || 'me',
       senderRole: roleRef.current || 'unknown',
       originalText: trimmed,
       translatedText: 'Translating...',
